@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 API_KEY = os.getenv("API_KEY", "votre-cle-secrete-a-changer")  # À définir dans les variables d'environnement
-MAX_FILE_SIZE_MB = 50  # Limite de taille de fichier
+MAX_FILE_SIZE_MB = 100  # Limite de taille de fichier
 
 app = FastAPI(
     title="Document Processing API",
