@@ -20,6 +20,7 @@ import datetime
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
+from xml.sax.saxutils import escape as xml_escape
 import logging
 import os
 
@@ -543,24 +544,99 @@ def get_paragraph_props(p, style_props: dict, doc_defaults: dict) -> dict:
         "shading_color": shading_color
     }
 
+
+def extract_runs_with_formatting(p):
+    """Extrait les runs avec leur formatage individuel ET les caractères spéciaux"""
+    w_ns = "{" + NS['w'] + "}"
+    runs_data = []
+    
+    for r in p.findall("w:r", NS):
+        run_info = {"texts": [], "props": {}}
+        
+        rPr = r.find("w:rPr", NS)
+        if rPr is not None:
+            b = rPr.find("w:b", NS)
+            if b is not None:
+                b_val = b.attrib.get(w_ns + "val", "1")
+                run_info["props"]["bold"] = b_val not in ("0", "false", "False")
+            
+            i_elem = rPr.find("w:i", NS)
+            if i_elem is not None:
+                i_val = i_elem.attrib.get(w_ns + "val", "1")
+                run_info["props"]["italic"] = i_val not in ("0", "false", "False")
+            
+            u = rPr.find("w:u", NS)
+            if u is not None:
+                u_val = u.attrib.get(w_ns + "val", "single")
+                if u_val != "none":
+                    run_info["props"]["underline"] = True
+                    run_info["props"]["underline_type"] = u_val
+            
+            if rPr.find("w:strike", NS) is not None:
+                run_info["props"]["strike"] = True
+            
+            rFonts = rPr.find("w:rFonts", NS)
+            if rFonts is not None:
+                for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+                    font = rFonts.attrib.get(w_ns + attr)
+                    if font:
+                        run_info["props"]["font_name"] = font
+                        break
+            
+            sz = rPr.find("w:sz", NS)
+            if sz is not None:
+                val = sz.attrib.get(w_ns + "val")
+                if val and val.isdigit():
+                    try:
+                        run_info["props"]["font_size"] = round(int(val) / 2.0, 2)
+                    except:
+                        pass
+            
+            color = rPr.find("w:color", NS)
+            if color is not None:
+                run_info["props"]["color"] = color.attrib.get(w_ns + "val", "")
+            
+            highlight = rPr.find("w:highlight", NS)
+            if highlight is not None:
+                run_info["props"]["highlight"] = highlight.attrib.get(w_ns + "val", "")
+        
+        for child in r:
+            if child.tag == w_ns + "t":
+                if child.text:
+                    run_info["texts"].append({"type": "text", "value": child.text})
+            elif child.tag == w_ns + "tab":
+                run_info["texts"].append({"type": "tab", "value": "\t"})
+            elif child.tag == w_ns + "br":
+                br_type = child.attrib.get(w_ns + "type", "textWrapping")
+                if br_type == "page":
+                    run_info["texts"].append({"type": "page_break", "value": "<<PAGE_BREAK>>"})
+                else:
+                    run_info["texts"].append({"type": "line_break", "value": "\n"})
+            elif child.tag == w_ns + "noBreakHyphen":
+                run_info["texts"].append({"type": "text", "value": "‑"})
+        
+        if run_info["texts"]:
+            runs_data.append(run_info)
+    
+    return runs_data
+
 def get_paragraph_text_by_sentences(p):
-    """Extrait le texte du paragraphe divisé par phrases"""
+    """Extrait le texte avec caractères spéciaux ET la structure des runs"""
     w_ns = "{" + NS['w'] + "}"
     
-    # Construire le texte complet du paragraphe
-    text_parts = []
-    for node in p.iter():
-        if node.tag == w_ns + "t":
-            text_parts.append(node.text or "")
+    runs_data = extract_runs_with_formatting(p)
     
-    full_text = "".join(text_parts).strip()
+    full_text_parts = []
+    for run in runs_data:
+        for text_segment in run["texts"]:
+            full_text_parts.append(text_segment["value"])
+    
+    full_text = "".join(full_text_parts).strip()
     
     if not full_text:
-        return [""]
+        return [""], []
     
-    # Diviser par phrases
     sentence_endings = re.compile(r'([.!?]+)(\s+|$)')
-    
     sentences = []
     current_pos = 0
     
@@ -576,7 +652,8 @@ def get_paragraph_text_by_sentences(p):
         if remaining:
             sentences.append(remaining)
     
-    return sentences if sentences else [full_text]
+    return (sentences if sentences else [full_text]), runs_data
+
 
 def get_table_cell_props(tc):
     """Extrait les propriétés de cellule de tableau"""
@@ -625,7 +702,8 @@ def extract_paragraph_segment(p, style_map: dict, style_props: dict, doc_default
     style_name = style_map.get(props["style_id"], props["style_id"] or "Normal")
     
     # Extraire le texte par phrases
-    sentences = get_paragraph_text_by_sentences(p)
+    sentences, runs_data = get_paragraph_text_by_sentences(p)
+    runs_json = json.dumps(runs_data, ensure_ascii=False)
     
     # Créer un segment par phrase
     segments = []
@@ -634,6 +712,7 @@ def extract_paragraph_segment(p, style_map: dict, style_props: dict, doc_default
             "paragraph_id": paragraph_id,
             "style": style_name,
             "content_source": sentence_text,
+            "runs_data": runs_json,
             "alignment": props["align"],
             "spacing_before": props["spacing_before"],
             "spacing_after": props["spacing_after"],
