@@ -874,7 +874,6 @@ async def extract_document_endpoint(
         logger.error(f"Extraction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
-
 # ==================== RECONSTRUCTION FUNCTIONS ====================
 
 def as_bool(v):
@@ -1555,43 +1554,8 @@ def build_docx_zip(document_meta, segments):
     bio.seek(0)
     return bio.read()
 
-# ==================== MAIN ====================
-
-payload_json = input.get("payload_json")
-if not payload_json:
-    print(json.dumps({"ok": False, "error": "Missing payload_json"}))
-    raise SystemExit
-
-try:
-    payload = json.loads(payload_json)
-except Exception as e:
-    print(json.dumps({"ok": False, "error": "Invalid JSON", "detail": str(e)}))
-    raise SystemExit
-
-document_meta = payload.get("document", {}) or {}
-segments_raw = payload.get("segments", []) or []
-
-# Gérer le cas où segments est un array de strings JSON
-segments = []
-for item in segments_raw:
-    if isinstance(item, str):
-        try:
-            segments.append(json.loads(item))
-        except:
-            pass
-    elif isinstance(item, dict):
-        segments.append(item)
-
-if not segments:
-    print(json.dumps({"ok": False, "error": "No valid segments found"}))
-    raise SystemExit
-
-docx_bytes = build_docx_zip(document_meta, segments)
-file_base64 = base64.b64encode(docx_bytes).decode("utf-8")
-
 
 # ==================== API ENDPOINTS ====================
-
 
 @app.post("/reconstruct-document")
 async def reconstruct_document_endpoint(
@@ -1645,6 +1609,7 @@ async def reconstruct_document_endpoint(
     except Exception as e:
         logger.error(f"Reconstruction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Reconstruction failed: {str(e)}")
+
 
 # ==================== ERROR HANDLERS ====================
 
