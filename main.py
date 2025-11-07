@@ -20,7 +20,6 @@ import datetime
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
-from xml.sax.saxutils import escape as xml_escape
 import logging
 import os
 
@@ -544,99 +543,24 @@ def get_paragraph_props(p, style_props: dict, doc_defaults: dict) -> dict:
         "shading_color": shading_color
     }
 
-
-def extract_runs_with_formatting(p):
-    """Extrait les runs avec leur formatage individuel ET les caractères spéciaux"""
-    w_ns = "{" + NS['w'] + "}"
-    runs_data = []
-    
-    for r in p.findall("w:r", NS):
-        run_info = {"texts": [], "props": {}}
-        
-        rPr = r.find("w:rPr", NS)
-        if rPr is not None:
-            b = rPr.find("w:b", NS)
-            if b is not None:
-                b_val = b.attrib.get(w_ns + "val", "1")
-                run_info["props"]["bold"] = b_val not in ("0", "false", "False")
-            
-            i_elem = rPr.find("w:i", NS)
-            if i_elem is not None:
-                i_val = i_elem.attrib.get(w_ns + "val", "1")
-                run_info["props"]["italic"] = i_val not in ("0", "false", "False")
-            
-            u = rPr.find("w:u", NS)
-            if u is not None:
-                u_val = u.attrib.get(w_ns + "val", "single")
-                if u_val != "none":
-                    run_info["props"]["underline"] = True
-                    run_info["props"]["underline_type"] = u_val
-            
-            if rPr.find("w:strike", NS) is not None:
-                run_info["props"]["strike"] = True
-            
-            rFonts = rPr.find("w:rFonts", NS)
-            if rFonts is not None:
-                for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
-                    font = rFonts.attrib.get(w_ns + attr)
-                    if font:
-                        run_info["props"]["font_name"] = font
-                        break
-            
-            sz = rPr.find("w:sz", NS)
-            if sz is not None:
-                val = sz.attrib.get(w_ns + "val")
-                if val and val.isdigit():
-                    try:
-                        run_info["props"]["font_size"] = round(int(val) / 2.0, 2)
-                    except:
-                        pass
-            
-            color = rPr.find("w:color", NS)
-            if color is not None:
-                run_info["props"]["color"] = color.attrib.get(w_ns + "val", "")
-            
-            highlight = rPr.find("w:highlight", NS)
-            if highlight is not None:
-                run_info["props"]["highlight"] = highlight.attrib.get(w_ns + "val", "")
-        
-        for child in r:
-            if child.tag == w_ns + "t":
-                if child.text:
-                    run_info["texts"].append({"type": "text", "value": child.text})
-            elif child.tag == w_ns + "tab":
-                run_info["texts"].append({"type": "tab", "value": "\t"})
-            elif child.tag == w_ns + "br":
-                br_type = child.attrib.get(w_ns + "type", "textWrapping")
-                if br_type == "page":
-                    run_info["texts"].append({"type": "page_break", "value": "<<PAGE_BREAK>>"})
-                else:
-                    run_info["texts"].append({"type": "line_break", "value": "\n"})
-            elif child.tag == w_ns + "noBreakHyphen":
-                run_info["texts"].append({"type": "text", "value": "‑"})
-        
-        if run_info["texts"]:
-            runs_data.append(run_info)
-    
-    return runs_data
-
 def get_paragraph_text_by_sentences(p):
-    """Extrait le texte avec caractères spéciaux ET la structure des runs"""
+    """Extrait le texte du paragraphe divisé par phrases"""
     w_ns = "{" + NS['w'] + "}"
     
-    runs_data = extract_runs_with_formatting(p)
+    # Construire le texte complet du paragraphe
+    text_parts = []
+    for node in p.iter():
+        if node.tag == w_ns + "t":
+            text_parts.append(node.text or "")
     
-    full_text_parts = []
-    for run in runs_data:
-        for text_segment in run["texts"]:
-            full_text_parts.append(text_segment["value"])
-    
-    full_text = "".join(full_text_parts).strip()
+    full_text = "".join(text_parts).strip()
     
     if not full_text:
-        return [""], []
+        return [""]
     
+    # Diviser par phrases
     sentence_endings = re.compile(r'([.!?]+)(\s+|$)')
+    
     sentences = []
     current_pos = 0
     
@@ -652,8 +576,7 @@ def get_paragraph_text_by_sentences(p):
         if remaining:
             sentences.append(remaining)
     
-    return (sentences if sentences else [full_text]), runs_data
-
+    return sentences if sentences else [full_text]
 
 def get_table_cell_props(tc):
     """Extrait les propriétés de cellule de tableau"""
@@ -702,8 +625,7 @@ def extract_paragraph_segment(p, style_map: dict, style_props: dict, doc_default
     style_name = style_map.get(props["style_id"], props["style_id"] or "Normal")
     
     # Extraire le texte par phrases
-    sentences, runs_data = get_paragraph_text_by_sentences(p)
-    runs_json = json.dumps(runs_data, ensure_ascii=False)
+    sentences = get_paragraph_text_by_sentences(p)
     
     # Créer un segment par phrase
     segments = []
@@ -712,7 +634,6 @@ def extract_paragraph_segment(p, style_map: dict, style_props: dict, doc_default
             "paragraph_id": paragraph_id,
             "style": style_name,
             "content_source": sentence_text,
-            "runs_data": runs_json,
             "alignment": props["align"],
             "spacing_before": props["spacing_before"],
             "spacing_after": props["spacing_after"],
@@ -953,6 +874,725 @@ async def extract_document_endpoint(
         logger.error(f"Extraction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
+
+# ==================== RECONSTRUCTION FUNCTIONS ====================
+
+def as_bool(v):
+    """Convertit une valeur en booléen"""
+    if v in (True, 1, "1", "true", "True", "TRUE", "yes"):
+        return True
+    return False
+
+def to_int(v):
+    """Convertit une valeur en entier"""
+    try:
+        if v in (None, "", "null"):
+            return None
+        return int(v)
+    except:
+        return None
+
+def to_str(v):
+    """Convertit une valeur en string, retourne vide si None"""
+    if v in (None, "null", "None"):
+        return ""
+    return str(v)
+
+def norm_align(a):
+    """Normalise l'alignement"""
+    a = (a or "").lower()
+    return {"left": "left", "center": "center", "right": "right", "both": "both", "justify": "both"}.get(a, "left")
+
+def norm_style(s):
+    """Normalise le style"""
+    s = (s or "").lower()
+    if "table cell" in s:
+        return s
+    if "heading 1" in s:
+        return "heading1"
+    if "heading 2" in s:
+        return "heading2"
+    if "heading 3" in s:
+        return "heading3"
+    if "heading 4" in s:
+        return "heading4"
+    if "list paragraph" in s:
+        return "listparagraph"
+    return "normal"
+
+def xml_header():
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+
+def content_types_xml():
+    return f'''{xml_header()}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>'''
+
+def rels_root_xml():
+    return f'''{xml_header()}
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+
+def document_rels_xml():
+    return f'''{xml_header()}
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>'''
+
+def app_xml():
+    return f'''{xml_header()}
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+ xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>Make DOCX Builder Enhanced v2.0</Application>
+</Properties>'''
+
+def core_xml(creator="Make", title="Rebuilt", subject="", description=""):
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f'''{xml_header()}
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:dcmitype="http://purl.org/dc/dcmitype/"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>{xml_escape(title)}</dc:title>
+  <dc:subject>{xml_escape(subject)}</dc:subject>
+  <dc:creator>{xml_escape(creator)}</dc:creator>
+  <cp:description>{xml_escape(description)}</cp:description>
+  <cp:lastModifiedBy>{xml_escape(creator)}</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>
+</cp:coreProperties>'''
+
+def styles_xml():
+    return f'''{xml_header()}
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/><w:qFormat/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:keepNext/><w:spacing w:before="240" w:after="60"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="32"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:keepNext/><w:spacing w:before="200" w:after="40"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="28"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:keepNext/><w:spacing w:before="160" w:after="20"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="24"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading4">
+    <w:name w:val="heading 4"/><w:basedOn w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:keepNext/><w:spacing w:before="120" w:after="20"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="22"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="ListParagraph">
+    <w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/>
+    <w:pPr><w:ind w:left="720"/></w:pPr>
+  </w:style>
+</w:styles>'''
+
+def numbering_xml():
+    """Génère le fichier de numérotation pour les listes"""
+    return f'''{xml_header()}
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:multiLevelType w:val="hybridMultilevel"/>
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="bullet"/>
+      <w:lvlText w:val="•"/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    </w:lvl>
+    <w:lvl w:ilvl="1">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="bullet"/>
+      <w:lvlText w:val="o"/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:abstractNum w:abstractNumId="1">
+    <w:multiLevelType w:val="hybridMultilevel"/>
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    </w:lvl>
+    <w:lvl w:ilvl="1">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="lowerLetter"/>
+      <w:lvlText w:val="%2."/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+  <w:num w:numId="2">
+    <w:abstractNumId w:val="1"/>
+  </w:num>
+</w:numbering>'''
+
+def to_w_style(style_key):
+    """Convertit le style normalisé en ID Word"""
+    m = {
+        "heading1": "Heading1", "heading2": "Heading2", "heading3": "Heading3", "heading4": "Heading4",
+        "listparagraph": "ListParagraph", "normal": "Normal"
+    }
+    return m.get(style_key, "Normal")
+
+def align_to_wjc(al):
+    """Convertit l'alignement en valeur Word"""
+    return {"left": "left", "center": "center", "right": "right", "both": "both"}.get(al, "left")
+
+# ==================== NOUVELLES FONCTIONS POUR FORMATAGE MIXTE ====================
+
+def build_run_xml_from_data(run_data, default_props):
+    """
+    ✨ NOUVELLE FONCTION ✨
+    Construit un run XML à partir de la structure détaillée.
+    Supporte le formatage mixte et les caractères spéciaux.
+    """
+    parts = []
+    
+    # Propriétés du run (fusionner avec les valeurs par défaut)
+    props = {**default_props, **run_data.get("props", {})}
+    
+    # Construire rPr
+    rPr_parts = []
+    
+    if props.get("bold"):
+        rPr_parts.append('<w:b/>')
+    
+    if props.get("italic"):
+        rPr_parts.append('<w:i/>')
+    
+    if props.get("underline"):
+        u_type = props.get("underline_type", "single")
+        rPr_parts.append(f'<w:u w:val="{u_type}"/>')
+    
+    if props.get("strike"):
+        rPr_parts.append('<w:strike/>')
+    
+    font_name = props.get("font_name", "")
+    if font_name:
+        rPr_parts.append(f'<w:rFonts w:ascii="{xml_escape(font_name)}" w:hAnsi="{xml_escape(font_name)}"/>')
+    
+    font_size = props.get("font_size")
+    if font_size:
+        try:
+            sz = int(float(font_size) * 2)
+            rPr_parts.append(f'<w:sz w:val="{sz}"/>')
+            rPr_parts.append(f'<w:szCs w:val="{sz}"/>')
+        except:
+            pass
+    
+    color = props.get("color", "")
+    if color and color != "auto":
+        rPr_parts.append(f'<w:color w:val="{color}"/>')
+    
+    highlight = props.get("highlight", "")
+    if highlight:
+        rPr_parts.append(f'<w:highlight w:val="{highlight}"/>')
+    
+    rPr_xml = "".join(rPr_parts)
+    
+    # Construire le contenu du run avec caractères spéciaux
+    for text_segment in run_data.get("texts", []):
+        seg_type = text_segment.get("type", "text")
+        value = text_segment.get("value", "")
+        
+        if seg_type == "text":
+            # Texte normal
+            escaped_text = xml_escape(value)
+            if rPr_xml:
+                parts.append(f'<w:r><w:rPr>{rPr_xml}</w:rPr><w:t xml:space="preserve">{escaped_text}</w:t></w:r>')
+            else:
+                parts.append(f'<w:r><w:t xml:space="preserve">{escaped_text}</w:t></w:r>')
+        
+        elif seg_type == "tab":
+            # Tabulation
+            if rPr_xml:
+                parts.append(f'<w:r><w:rPr>{rPr_xml}</w:rPr><w:tab/></w:r>')
+            else:
+                parts.append('<w:r><w:tab/></w:r>')
+        
+        elif seg_type == "line_break":
+            # Saut de ligne manuel
+            if rPr_xml:
+                parts.append(f'<w:r><w:rPr>{rPr_xml}</w:rPr><w:br/></w:r>')
+            else:
+                parts.append('<w:r><w:br/></w:r>')
+        
+        elif seg_type == "page_break":
+            # Saut de page manuel
+            if rPr_xml:
+                parts.append(f'<w:r><w:rPr>{rPr_xml}</w:rPr><w:br w:type="page"/></w:r>')
+            else:
+                parts.append('<w:r><w:br w:type="page"/></w:r>')
+    
+    return "".join(parts)
+
+def build_run_props(seg):
+    """Construit les propriétés de run (rPr) à partir du segment - VERSION SIMPLE"""
+    parts = []
+    
+    if as_bool(seg.get("bold_any")):
+        parts.append('<w:b/>')
+    
+    if as_bool(seg.get("italic_any")):
+        parts.append('<w:i/>')
+    
+    if as_bool(seg.get("underline_any")):
+        u_type = to_str(seg.get("underline_type")) or "single"
+        parts.append(f'<w:u w:val="{u_type}"/>')
+    
+    if as_bool(seg.get("strike_any")):
+        parts.append('<w:strike/>')
+    
+    if as_bool(seg.get("double_strike_any")):
+        parts.append('<w:dstrike/>')
+    
+    if as_bool(seg.get("small_caps_any")):
+        parts.append('<w:smallCaps/>')
+    
+    if as_bool(seg.get("all_caps_any")):
+        parts.append('<w:caps/>')
+    
+    font_name = to_str(seg.get("font_name_major"))
+    if font_name:
+        parts.append(f'<w:rFonts w:ascii="{xml_escape(font_name)}" w:hAnsi="{xml_escape(font_name)}"/>')
+    
+    font_size = seg.get("font_size_pt_major")
+    if font_size:
+        try:
+            sz = int(float(font_size) * 2)
+            parts.append(f'<w:sz w:val="{sz}"/>')
+            parts.append(f'<w:szCs w:val="{sz}"/>')
+        except:
+            pass
+    
+    color = to_str(seg.get("color"))
+    if color and color != "auto":
+        parts.append(f'<w:color w:val="{color}"/>')
+    
+    highlight = to_str(seg.get("highlight"))
+    if highlight:
+        parts.append(f'<w:highlight w:val="{highlight}"/>')
+    
+    shading_fill = to_str(seg.get("shading_fill"))
+    if shading_fill:
+        parts.append(f'<w:shd w:val="clear" w:fill="{shading_fill}"/>')
+    
+    return "".join(parts)
+
+def build_paragraph_props(seg):
+    """Construit les propriétés de paragraphe (pPr) à partir du segment"""
+    parts = []
+    
+    style_key = norm_style(seg.get("style", ""))
+    if not style_key.startswith("table cell"):
+        style_id = to_w_style(style_key)
+        parts.append(f'<w:pStyle w:val="{style_id}"/>')
+    
+    align = norm_align(seg.get("alignment"))
+    jc = align_to_wjc(align)
+    parts.append(f'<w:jc w:val="{jc}"/>')
+    
+    spacing_parts = []
+    spacing_before = to_str(seg.get("spacing_before"))
+    spacing_after = to_str(seg.get("spacing_after"))
+    spacing_line = to_str(seg.get("spacing_line"))
+    spacing_line_rule = to_str(seg.get("spacing_line_rule"))
+    
+    if spacing_before:
+        spacing_parts.append(f'w:before="{spacing_before}"')
+    if spacing_after:
+        spacing_parts.append(f'w:after="{spacing_after}"')
+    if spacing_line:
+        spacing_parts.append(f'w:line="{spacing_line}"')
+    if spacing_line_rule:
+        spacing_parts.append(f'w:lineRule="{spacing_line_rule}"')
+    
+    if spacing_parts:
+        parts.append(f'<w:spacing {" ".join(spacing_parts)}/>')
+    
+    indent_parts = []
+    indent_left = to_str(seg.get("indent_left"))
+    indent_right = to_str(seg.get("indent_right"))
+    indent_first = to_str(seg.get("indent_first_line"))
+    indent_hanging = to_str(seg.get("indent_hanging"))
+    
+    if indent_left:
+        indent_parts.append(f'w:left="{indent_left}"')
+    if indent_right:
+        indent_parts.append(f'w:right="{indent_right}"')
+    if indent_first:
+        indent_parts.append(f'w:firstLine="{indent_first}"')
+    if indent_hanging:
+        indent_parts.append(f'w:hanging="{indent_hanging}"')
+    
+    if indent_parts:
+        parts.append(f'<w:ind {" ".join(indent_parts)}/>')
+    
+    num_id = to_str(seg.get("numId"))
+    ilvl = to_str(seg.get("ilvl"))
+    if num_id:
+        parts.append(f'<w:numPr><w:ilvl w:val="{ilvl or "0"}"/><w:numId w:val="{num_id}"/></w:numPr>')
+    
+    if as_bool(seg.get("keep_next")):
+        parts.append('<w:keepNext/>')
+    if as_bool(seg.get("keep_lines")):
+        parts.append('<w:keepLines/>')
+    if as_bool(seg.get("page_break_before")):
+        parts.append('<w:pageBreakBefore/>')
+    
+    shading_para_fill = to_str(seg.get("shading_para_fill"))
+    if shading_para_fill:
+        parts.append(f'<w:shd w:val="clear" w:fill="{shading_para_fill}"/>')
+    
+    return "".join(parts)
+
+def run_xml(text, seg):
+    """Génère un run XML simple - VERSION FALLBACK"""
+    t = xml_escape(text or "")
+    rPr = build_run_props(seg)
+    
+    if rPr:
+        return f'<w:r><w:rPr>{rPr}</w:rPr><w:t xml:space="preserve">{t}</w:t></w:r>'
+    else:
+        return f'<w:r><w:t xml:space="preserve">{t}</w:t></w:r>'
+
+def paragraph_xml_enhanced(seg):
+    """
+    ✨ VERSION AMÉLIORÉE ✨
+    Génère un paragraphe XML avec formatage mixte et caractères spéciaux.
+    """
+    pPr = build_paragraph_props(seg)
+    
+    # Vérifier si on a des données de runs détaillées
+    runs_json = seg.get("runs_data", "")
+    
+    if runs_json and runs_json != "":
+        try:
+            # Utiliser la structure détaillée des runs
+            runs_data = json.loads(runs_json)
+            
+            # Extraire les propriétés par défaut du segment
+            default_props = {
+                "bold": as_bool(seg.get("bold_any")),
+                "italic": as_bool(seg.get("italic_any")),
+                "underline": as_bool(seg.get("underline_any")),
+                "underline_type": to_str(seg.get("underline_type")) or "single",
+                "strike": as_bool(seg.get("strike_any")),
+                "font_name": to_str(seg.get("font_name_major")),
+                "font_size": seg.get("font_size_pt_major"),
+                "color": to_str(seg.get("color")),
+                "highlight": to_str(seg.get("highlight"))
+            }
+            
+            # Construire tous les runs
+            runs_xml_parts = []
+            for run_data in runs_data:
+                run_xml_str = build_run_xml_from_data(run_data, default_props)
+                if run_xml_str:
+                    runs_xml_parts.append(run_xml_str)
+            
+            runs_xml = "".join(runs_xml_parts)
+            
+            return f'<w:p><w:pPr>{pPr}</w:pPr>{runs_xml}</w:p>'
+        
+        except (json.JSONDecodeError, Exception):
+            # Fallback sur l'ancienne méthode si parsing échoue
+            pass
+    
+    # Méthode de fallback: un seul run avec tout le texte
+    text = seg.get("content_source", "")
+    r = run_xml(text, seg)
+    return f'<w:p><w:pPr>{pPr}</w:pPr>{r}</w:p>'
+
+def build_table_cell_props(seg):
+    """Construit les propriétés de cellule (tcPr)"""
+    parts = []
+    
+    grid_span = to_str(seg.get("cell_gridSpan"))
+    if grid_span and grid_span != "1":
+        parts.append(f'<w:gridSpan w:val="{grid_span}"/>')
+    
+    v_merge = to_str(seg.get("cell_vMerge"))
+    if v_merge:
+        if v_merge == "restart":
+            parts.append('<w:vMerge w:val="restart"/>')
+        else:
+            parts.append('<w:vMerge/>')
+    
+    v_align = to_str(seg.get("cell_vAlign"))
+    if v_align:
+        parts.append(f'<w:vAlign w:val="{v_align}"/>')
+    
+    cell_width = to_str(seg.get("cell_width"))
+    if cell_width:
+        parts.append(f'<w:tcW w:w="{cell_width}" w:type="dxa"/>')
+    else:
+        parts.append('<w:tcW w:w="2390" w:type="dxa"/>')
+    
+    cell_shading = to_str(seg.get("cell_shading_fill"))
+    if cell_shading:
+        parts.append(f'<w:shd w:val="clear" w:fill="{cell_shading}"/>')
+    
+    return "".join(parts)
+
+def table_xml_enhanced(cells, rows, cols):
+    """
+    ✨ VERSION AMÉLIORÉE ✨
+    Génère un tableau avec support du formatage mixte.
+    """
+    parts = []
+    parts.append('<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">')
+    parts.append('<w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders><w:top w:val="single" w:sz="4"/><w:left w:val="single" w:sz="4"/><w:bottom w:val="single" w:sz="4"/><w:right w:val="single" w:sz="4"/><w:insideH w:val="single" w:sz="4"/><w:insideV w:val="single" w:sz="4"/></w:tblBorders></w:tblPr>')
+    parts.append('<w:tblGrid>' + ''.join('<w:gridCol w:w="2390"/>' for _ in range(cols)) + '</w:tblGrid>')
+    
+    for r in range(1, rows + 1):
+        parts.append('<w:tr>')
+        for c in range(1, cols + 1):
+            parts.append('<w:tc>')
+            
+            cell_segments = cells.get((r, c), [])
+            if cell_segments:
+                first_seg = cell_segments[0]
+                tcPr = build_table_cell_props(first_seg)
+                parts.append(f'<w:tcPr>{tcPr}</w:tcPr>')
+            else:
+                parts.append('<w:tcPr><w:tcW w:w="2390" w:type="dxa"/></w:tcPr>')
+            
+            if cell_segments:
+                # Regrouper par paragraph_id
+                paragraphs = {}
+                for seg in cell_segments:
+                    para_id = seg.get("paragraph_id", seg.get("order", ""))
+                    if para_id not in paragraphs:
+                        paragraphs[para_id] = []
+                    paragraphs[para_id].append(seg)
+                
+                # Générer un paragraphe par paragraph_id
+                for para_id in sorted(paragraphs.keys()):
+                    para_segments = sorted(paragraphs[para_id], key=lambda x: x.get("order", 0))
+                    
+                    # Combiner intelligemment avec runs_data
+                    has_runs_data = all(seg.get("runs_data") for seg in para_segments)
+                    
+                    if has_runs_data and len(para_segments) > 1:
+                        combined_runs = []
+                        for seg in para_segments:
+                            try:
+                                runs = json.loads(seg.get("runs_data", "[]"))
+                                combined_runs.extend(runs)
+                                # Ajouter un espace entre les phrases
+                                combined_runs.append({
+                                    "texts": [{"type": "text", "value": " "}],
+                                    "props": {}
+                                })
+                            except:
+                                pass
+                        
+                        first_seg = para_segments[0]
+                        combined_seg = {**first_seg, "runs_data": json.dumps(combined_runs)}
+                        parts.append(paragraph_xml_enhanced(combined_seg))
+                    else:
+                        # Traiter chaque segment individuellement
+                        for seg in para_segments:
+                            parts.append(paragraph_xml_enhanced(seg))
+            else:
+                parts.append('<w:p><w:pPr/></w:p>')
+            
+            parts.append('</w:tc>')
+        parts.append('</w:tr>')
+    
+    parts.append('</w:tbl>')
+    return ''.join(parts)
+
+def build_document_xml_enhanced(segments):
+    """
+    ✨ VERSION AMÉLIORÉE ✨
+    Construit le document.xml avec support du formatage mixte.
+    """
+    body_paragraphs = {}
+    tables = {}
+    
+    for s in segments:
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except:
+                continue
+        if not isinstance(s, dict):
+            continue
+        
+        seg = {**s}
+        seg["order"] = to_int(seg.get("order")) or 0
+        seg["table_index"] = to_int(seg.get("table_index"))
+        seg["row_index"] = to_int(seg.get("row_index"))
+        seg["col_index"] = to_int(seg.get("col_index"))
+        seg["paragraph_id"] = to_str(seg.get("paragraph_id")) or str(seg["order"])
+        
+        if seg["table_index"]:
+            tables.setdefault(seg["table_index"], []).append(seg)
+        else:
+            para_id = seg["paragraph_id"]
+            if para_id not in body_paragraphs:
+                body_paragraphs[para_id] = []
+            body_paragraphs[para_id].append(seg)
+
+    parts = []
+    parts.append(xml_header())
+    parts.append('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ')
+    parts.append('xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">')
+    parts.append('<w:body>')
+
+    # Trier les paragraphes
+    sorted_para_ids = sorted(
+        body_paragraphs.keys(),
+        key=lambda pid: min(seg["order"] for seg in body_paragraphs[pid])
+    )
+    
+    for para_id in sorted_para_ids:
+        para_segments = sorted(body_paragraphs[para_id], key=lambda x: x["order"])
+        
+        # Vérifier si on doit combiner les segments
+        has_runs_data = all(seg.get("runs_data") for seg in para_segments)
+        
+        if has_runs_data and len(para_segments) > 1:
+            # Combiner les runs_data de tous les segments
+            combined_runs = []
+            for seg in para_segments:
+                try:
+                    runs = json.loads(seg.get("runs_data", "[]"))
+                    combined_runs.extend(runs)
+                    # Ajouter un espace entre les phrases
+                    combined_runs.append({
+                        "texts": [{"type": "text", "value": " "}],
+                        "props": {}
+                    })
+                except:
+                    pass
+            
+            # Retirer le dernier espace ajouté
+            if combined_runs and combined_runs[-1].get("texts", [{}])[0].get("value") == " ":
+                combined_runs.pop()
+            
+            first_seg = para_segments[0]
+            combined_seg = {**first_seg, "runs_data": json.dumps(combined_runs)}
+            parts.append(paragraph_xml_enhanced(combined_seg))
+        else:
+            # Fallback: utiliser content_source combiné
+            text_parts = []
+            for seg in para_segments:
+                content = seg.get("content_source")
+                if content is not None and content != "":
+                    text_parts.append(str(content))
+            
+            combined_text = " ".join(text_parts) if text_parts else ""
+            first_seg = para_segments[0]
+            combined_seg = {**first_seg, "content_source": combined_text}
+            parts.append(paragraph_xml_enhanced(combined_seg))
+
+    # Tableaux
+    for t_idx in sorted(tables.keys()):
+        tseg = tables[t_idx]
+        max_r = max(s["row_index"] or 1 for s in tseg)
+        max_c = max(s["col_index"] or 1 for s in tseg)
+        cells = {}
+        for s in tseg:
+            r = s["row_index"] or 1
+            c = s["col_index"] or 1
+            cells.setdefault((r, c), []).append(s)
+        for k in list(cells.keys()):
+            cells[k] = sorted(cells[k], key=lambda seg: seg["order"])
+        parts.append(table_xml_enhanced(cells, max_r, max_c))
+
+    parts.append('<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>')
+    parts.append('</w:body></w:document>')
+    return ''.join(parts)
+
+def build_docx_zip(document_meta, segments):
+    """Construit le fichier DOCX complet"""
+    files = {
+        "[Content_Types].xml": content_types_xml().encode("utf-8"),
+        "_rels/.rels": rels_root_xml().encode("utf-8"),
+        "docProps/core.xml": core_xml(
+            creator=(document_meta.get("client") or "Make"),
+            title=(document_meta.get("file_name") or "Rebuilt"),
+            subject=document_meta.get("project") or "",
+            description="Rebuilt with full formatting preservation v2.0"
+        ).encode("utf-8"),
+        "docProps/app.xml": app_xml().encode("utf-8"),
+        "word/_rels/document.xml.rels": document_rels_xml().encode("utf-8"),
+        "word/styles.xml": styles_xml().encode("utf-8"),
+        "word/numbering.xml": numbering_xml().encode("utf-8"),
+        "word/document.xml": build_document_xml_enhanced(segments).encode("utf-8"),
+    }
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        for path, data in files.items():
+            z.writestr(path, data)
+    bio.seek(0)
+    return bio.read()
+
+# ==================== MAIN ====================
+
+payload_json = input.get("payload_json")
+if not payload_json:
+    print(json.dumps({"ok": False, "error": "Missing payload_json"}))
+    raise SystemExit
+
+try:
+    payload = json.loads(payload_json)
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "Invalid JSON", "detail": str(e)}))
+    raise SystemExit
+
+document_meta = payload.get("document", {}) or {}
+segments_raw = payload.get("segments", []) or []
+
+# Gérer le cas où segments est un array de strings JSON
+segments = []
+for item in segments_raw:
+    if isinstance(item, str):
+        try:
+            segments.append(json.loads(item))
+        except:
+            pass
+    elif isinstance(item, dict):
+        segments.append(item)
+
+if not segments:
+    print(json.dumps({"ok": False, "error": "No valid segments found"}))
+    raise SystemExit
+
+docx_bytes = build_docx_zip(document_meta, segments)
+file_base64 = base64.b64encode(docx_bytes).decode("utf-8")
+
+
+# ==================== API ENDPOINTS ====================
+
+
 @app.post("/reconstruct-document")
 async def reconstruct_document_endpoint(
     request: ReconstructDocumentRequest,
@@ -960,26 +1600,48 @@ async def reconstruct_document_endpoint(
 ):
     """
     Reconstruit un document Word à partir de segments traduits
-    
-    Cette fonction sera implémentée avec le code du module 32
-    Pour l'instant, retourne un placeholder
+    Retourne le document encodé en base64
     """
     try:
         # Vérifier l'API key
         verify_api_key(x_api_key)
         
         logger.info(f"Starting reconstruction for: {request.file_name}")
+        start_time = datetime.datetime.utcnow()
         
-        # TODO: Implémenter la reconstruction du document
-        # Ce sera le code du module 32 adapté
+        # Extraire les données
+        document_meta = request.document_metadata or {}
+        segments = request.segments
+        
+        if not segments:
+            raise ValueError("No segments provided")
+        
+        # Construire le document
+        docx_bytes = build_docx_zip(document_meta, segments)
+        file_base64 = base64.b64encode(docx_bytes).decode("utf-8")
+        
+        # Générer le nom du fichier
+        original_filename = request.file_name or "output.docx"
+        base_name = original_filename.replace(".docx", "").replace(".DOCX", "")
+        file_name = base_name + "_rebuilt.docx"
+        
+        end_time = datetime.datetime.utcnow()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        logger.info(f"Reconstruction completed in {processing_time:.2f}s")
         
         return {
             "success": True,
-            "message": "Reconstruction endpoint - to be implemented",
-            "file_name": request.file_name,
-            "segments_count": len(request.segments)
+            "file_name": file_name,
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "file_base64": file_base64,
+            "segment_count": len(segments),
+            "processing_time_seconds": round(processing_time, 2)
         }
         
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Reconstruction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Reconstruction failed: {str(e)}")
